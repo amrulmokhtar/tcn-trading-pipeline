@@ -1,18 +1,76 @@
-# env
-.venv/
-.vscode/
+# --- Python ---
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
 
-# data and artifacts
+# --- Environments ---
+.env
+.venv/
+venv/
+ENV/
+env.bak/
+*.env
+
+# --- Jupyter / Notebooks ---
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# --- Data files ---
 data/*.csv
 data/*.parquet
 data/*.npz
+data/*.pkl
 data/*.json
-models/*.pt
-models/*.pkl
-results/
+*.db
+*.sqlite3
 
-# OS
-Thumbs.db
+# --- Logs / Temp ---
+*.log
+logs/
+tmp/
+temp/
+.cache/
+*.bak
+*.swp
+
+# --- VSCode / IDE ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- OS files ---
 .DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Model artifacts ---
+*.h5
+*.ckpt
+*.onnx
+*.pth
+*.pt
+models/
+checkpoints/
+runs/
+
+# --- Generated plots / images ---
+*.png
+*.jpg
+*.jpeg
+*.gif
+outputs/
+plots/
+figures/
+
+# --- Custom local scripts / debug ---
+debug/
+scratch/
+local_test/
