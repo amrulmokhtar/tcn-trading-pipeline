@@ -1,0 +1,18 @@
+# env
+.venv/
+.vscode/
+__pycache__/
+*.pyc
+
+# data and artifacts
+data/*.csv
+data/*.parquet
+data/*.npz
+data/*.json
+models/*.pt
+models/*.pkl
+results/
+
+# OS
+Thumbs.db
+.DS_Store
