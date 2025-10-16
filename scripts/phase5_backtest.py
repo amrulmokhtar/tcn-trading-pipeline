@@ -1,458 +1,446 @@
 # scripts/phase5_backtest.py
-# Rule-based backtest that mirrors SMC_2_6_1_VolumeFlow_OBV_Adaptive (no TCN)
+# Rules-only backtest (no TCN) with spread-to-ATR diagnostics
+# Works on: data/m15_features.parquet
+# Output: prints summary; optional trades.csv + backtest_summary.json
 
-import math
+from __future__ import annotations
 import json
+import math
 from pathlib import Path
 from typing import Tuple, Optional
 
 import numpy as np
 import pandas as pd
 
-# ------------------------- Paths -------------------------
-DATA_DIR     = Path("data")
-RESULTS_DIR  = Path("results")
+# =============== File paths ===============
+DATA_DIR    = Path("data")
+RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
-FEAT_PATH    = DATA_DIR / "m15_features.parquet"
 
-# Optional columns we will use if present
-COL = dict(
-    ts="timestamp",             # optional; if missing we synthesize 15m cadence
-    close="m15_close",
-    ema="m15_ema20",
-    atr="m15_atr14",
-    spread_to_atr="m15_spread_to_atr",
-    spread_pts="spread_points",  # optional
-    comm_usd="commission_roundtrip_usd",  # optional
-    h1_sma_fast="h1_sma20",
-    h1_sma_slow="h1_sma200",
-    h1_adx="h1_adx14",
-    h1_atr="h1_atr14",
-    h1_atr_pct="h1_atr_pct",
-    h1_vol_pct="h1_vol_pct",
-    h1_obv="h1_obv",
-    h1_obv_sma="h1_obv_sma50",
-    h1_obv_slope="h1_obv_slope_6",
-    # sessions (booleans already built in Phase-2)
-    asia="asia_session",
-    london="london_session",
-    ny="ny_session",
-)
+FEAT_PATH   = DATA_DIR / "m15_features.parquet"
+OUT_TRADES  = RESULTS_DIR / "trades.csv"
+OUT_SUMMARY = RESULTS_DIR / "backtest_summary.json"
 
-# ------------------------- SMC defaults (from your bot) -------------------------
-# Guards (spread; soft block; spread/ATR)
-MAX_SPREAD_POINTS     = 9999
-USE_SOFT_SPREAD_BLOCK = True
-SOFT_SPREAD_FRAC      = 0.60
-SPREAD_TO_ATR_CAP     = 9999
+# =============== Column names ===============
+COL = {
+    "ts":        "timestamp",
+    "close":     "m15_close",
+    "atr":       "m15_atr14",
+    # we only have normalized spread (spread/ATR)
+    "spread_atr": "m15_spread_to_atr",
+    "spread_pts": "m15_spread_to_atr",  # reuse same column
+    "commission": "commission_roundtrip_usd",  # optional
+    "sma_fast":  "h1_sma20",
+    "sma_slow":  "h1_sma200",
+    "adx":       "h1_adx14",
+    "obv_slope": "h1_obv_slope_6",
+    "asia":      "asia_session",
+    "london":    "london_session",
+    "ny":        "ny_session",
+}
 
-# Risk & stake
-USE_RISK_PCT       = True
-RISK_PCT           = 1.0
-FIXED_LOTS         = 0.02
+# =============== Filter toggles ===============
+USE_SESSION      = True
+USE_REGIME_FILTER= True
+USE_RANGE_SKIP   = True
+USE_ADX_FILTER   = True
+USE_OBV_PCT      = False   # keep False unless you have a pct column
+USE_OBV_CONFIRM  = False  # True if you want an OBV slope confirm
 
-# Regime & Range skip
-USE_REGIME_FILTER  = True
-H1_FAST_SMA        = 20
-H1_SLOW_SMA        = 200
-USE_RANGE_SKIP     = True
-RANGE_SEP_ATR_LONG = 0.35
-RANGE_SEP_ATR_SHORT= 0.45
+# =============== Spread constraints ===============
+MAX_SPREAD_POINTS = 30     # absolute points cap (tighten later)
+SPREAD_TO_ATR_CAP = 10     # <-- sweep 6..12 to find elbow; 10 is a good start
 
-# ADX
-USE_ADX_FILTER     = False
-ADX_PERIOD         = 14  # already precomputed
-ADX_LONG_MIN       = 22
-ADX_SHORT_MIN      = 30
+# =============== Session (Malaysia time) ===============
+TZ_OFFSET_H     = +8
+SESSION_START_H = 9        # 09:00 MYT
+SESSION_END_H   = 3        # 03:00 next day (wrap)
+SHORT_BLACKOUT_FROM_START_H = 2  # 09:00 -> 11:00: block shorts
+SHORT_BLACKOUT_BEFORE_END_H = 1  # last hour before 03:00: block shorts
+LONG_BLOCK_START_H = 21          # 21:00 -> 24:00: block longs
+LONG_BLOCK_END_H   = 24
 
-# Volume & OBV
-USE_VOL_PCT        = False
-VOL_PCT_MIN        = 35
-VOL_PCT_MAX        = 90
-USE_OBV_CONFIRM    = False
-OBV_SMA            = 50  # already precomputed as h1_obv_sma50
-OBV_SLOPE_BARS     = 6   # already precomputed as h1_obv_slope_6 (sign)
+# =============== Regime / Range skip ===============
+RANGE_SEP_ATR_LONG  = 0.35
+RANGE_SEP_ATR_SHORT = 0.45
 
-# Session (Malaysia)
-USE_SESSION        = False
-TZ_OFFSET_H        = +8
-SESSION_START_H    = 9   # 09:00 MYT
-SESSION_END_H      = 3   # 03:00 next day (wrap)
-SHORT_BLACKOUT_FROM_START_H = 2
-SHORT_BLACKOUT_BEFORE_END_H = 1
-LONG_BLOCK_START_H = 21
-LONG_BLOCK_END_H   = 24  # 21:00-24:00 longs blocked
+# =============== ADX thresholds ===============
+ADX_LONG_MIN  = 22
+ADX_SHORT_MIN = 30
 
-# Entry controls
-MAX_OPEN_POS        = 1      # single position model
-MIN_BARS_BETWEEN_LONG  = 18
-MIN_BARS_BETWEEN_SHORT = 20
-MIN_ENTRY_DIST_ATR_LONG  = 0.7
-MIN_ENTRY_DIST_ATR_SHORT = 0.8
-MIN_PULLBACK_ATR_LONG    = 0.5
-MIN_PULLBACK_ATR_SHORT   = 0.7
+# =============== Trade management (R is ATR at entry) ===============
+RISK_R           = 1.0     # SL distance in ATR multiples
+TP_R             = 2.0     # single TP at +2R
+MOVE_BE_AT_R     = 1.0     # move to BE at +1R
+TRAIL_START_R    = 3.0     # start trailing after 3R (disabled if <= TP_R)
+TRAIL_ATR_MULT   = 2.0     # trail = entry +/- ATR * mult
 
-# Management (R in ATR at entry)
-BE_R_LONG  = 1.25
-BE_R_SHORT = 1.35
-BE_ATR_BUFFER_FRAC = 0.12
-PARTIAL1_R       = 1.5
-PARTIAL1_PCT     = 25
-TRAIL_START_R_L  = 2.2
-TRAIL_START_R_S  = 2.4
-ATR_MULT_L       = 1.6
-ATR_MULT_S       = 1.8
-MAX_HOLD_BARS    = 240
+# =============== Utilities ===============
 
-# Basic execution/valuation assumptions for backtest
-PIP_SIZE   = 0.1       # XAUUSD pts->"pips" notion (tweak if you price in different units)
-PIP_USD    = 1.0       # USD value per pip per 1 lot equivalent (backtest unit stake)
-SL_ATR_R   = 1.0       # stop = 1.0 * ATR (at entry)
-EQUITY_USD = 10_000.0  # starting equity for sizing
-SLIPPAGE_PIPS = 0.0    # you can add slippage later
+def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
+    # basic presence
+    need_cols = [COL["close"], COL["atr"], COL["spread_atr"], COL["spread_pts"],
+                 COL["sma_fast"], COL["sma_slow"], COL["adx"],
+                 COL["asia"], COL["london"], COL["ny"]]
+    for c in need_cols:
+        if c not in df.columns:
+            raise ValueError(f"Missing column '{c}'.")
 
-# ------------------------------------------------------------------------------
+    # commission optional
+    if COL["commission"] not in df.columns:
+        df[COL["commission"]] = 0.0
 
-def load_features() -> pd.DataFrame:
-    df = pd.read_parquet(FEAT_PATH)
-    # optional synthetic timestamp if missing
+    # timestamp optional -> synthetic
     if COL["ts"] not in df.columns:
-        # synthetically create a 15-minute cadence
-        start = pd.Timestamp("2020-01-01 00:00:00", tz="UTC")
-        df.insert(0, COL["ts"], pd.date_range(start, periods=len(df), freq="15min", tz="UTC"))
+        # Create a synthetic 15-min timeline
+        n = len(df)
+        ts0 = pd.Timestamp("2020-01-01 00:00:00", tz="UTC")  # arbitrary start
+        df[COL["ts"]] = pd.date_range(ts0, periods=n, freq="15min")
         import warnings
         warnings.warn(f"'{COL['ts']}' missing; generating synthetic timestamps assuming 15-min bars.")
+
     return df
 
-# ---------- Guards & filters (mirror SMC) ----------
-
-def in_session_myt(ts_utc: pd.Timestamp) -> Tuple[bool,bool,bool,int]:
-    """Return session_ok, long_ok, short_ok, hour_myt."""
-    if not USE_SESSION:
-        return True, True, True, (ts_utc.tz_convert("UTC").hour + TZ_OFFSET_H) % 24
-
+def in_my_session(ts_utc: pd.Timestamp) -> Tuple[bool, bool, bool, int]:
+    """
+    Return: (session_ok, long_ok, short_ok, hour_myt)
+    Session window: 09:00 MYT -> 03:00 MYT (wrap).
+    Blackouts: shorts blocked at start window (first X hours) and final Y hours,
+               longs blocked nightly 21:00 -> 24:00 MYT.
+    """
     myt = ts_utc.tz_convert("UTC").tz_convert("Etc/GMT-0") + pd.Timedelta(hours=TZ_OFFSET_H)
     h = int(myt.hour)
 
-    # allowed window 09:00 → 03:00 (wrap)
-    def in_window(hh, s, e):
-        return (hh >= s and hh < 24) or (hh < e) if s > e else (s <= hh < e)
+    # allowed 09 -> 03 next day
+    def _in_window(hh: int) -> bool:
+        if SESSION_START_H < SESSION_END_H:  # non-wrap (not our case)
+            return SESSION_START_H <= hh < SESSION_END_H
+        # wrap case
+        return (hh >= SESSION_START_H) or (hh < SESSION_END_H)
 
-    session_ok = in_window(h, SESSION_START_H, SESSION_END_H)
+    ok = _in_window(h)
+    long_ok  = ok
+    short_ok = ok
 
-    # long side block 21 → 24
-    long_ok = session_ok and not in_window(h, LONG_BLOCK_START_H, LONG_BLOCK_END_H)
-    # short blackout: first N hours after start or last N hours before end
-    # crude but effective:
-    hours_since_start = (h - SESSION_START_H) % 24
-    # hours to end if wrap:
-    hours_to_end = (SESSION_END_H - h) % 24
-    short_blackout = hours_since_start < SHORT_BLACKOUT_FROM_START_H or \
-                     (0 <= hours_to_end <= SHORT_BLACKOUT_BEFORE_END_H)
-    short_ok = session_ok and not short_blackout
+    # longs blocked at night
+    if LONG_BLOCK_START_H <= h < LONG_BLOCK_END_H:
+        long_ok = False
 
-    return session_ok, long_ok, short_ok, h
-
-def spread_ok(row) -> bool:
-    pts = float(row.get(COL["spread_pts"], np.nan))
-    if np.isnan(pts):
-        # if no absolute points column, allow and rely on spread/ATR later
-        return True
-    if pts > MAX_SPREAD_POINTS:
-        return False
-    if USE_SOFT_SPREAD_BLOCK:
-        if pts > SOFT_SPREAD_FRAC * MAX_SPREAD_POINTS:
-            return False
-    return True
-
-def spread_vs_atr_ok(row) -> bool:
-    atr = float(row[COL["h1_atr"]])
-    if atr <= 0: 
-        return True
-    # if explicit points present, use that; else derive from spread_to_atr column if available
-    pts = row.get(COL["spread_pts"], np.nan)
-    if not np.isnan(pts):
-        spread_pips = pts  # already “points/pips” unit
-        ratio = (spread_pips) / (atr / PIP_SIZE)
-        return ratio <= SPREAD_TO_ATR_CAP
-    # else use precomputed ratio if present
-    if COL["spread_to_atr"] in row.index:
-        ratio = float(row[COL["spread_to_atr"]])
-        return ratio <= SPREAD_TO_ATR_CAP
-    return True
-
-def trend_with_range(row) -> int:
-    """+1 long, -1 short, 0 none; includes range skip by ATR distance of SMAs."""
-    if not USE_REGIME_FILTER:
-        return 0
-    fast = float(row[COL["h1_sma_fast"]])
-    slow = float(row[COL["h1_sma_slow"]])
-    if np.isnan(fast) or np.isnan(slow):
-        return 0
-    dir_ = 1 if fast > slow else (-1 if fast < slow else 0)
-    if not USE_RANGE_SKIP or dir_ == 0:
-        return dir_
-    atr = float(row[COL["h1_atr"]])
-    if atr <= 0:
-        return dir_
-    sep = abs(fast - slow)
-    ratio = sep / atr
-    if dir_ > 0 and ratio < RANGE_SEP_ATR_LONG:
-        return 0
-    if dir_ < 0 and ratio < RANGE_SEP_ATR_SHORT:
-        return 0
-    return dir_
-
-def adx_ok(row, dir_) -> bool:
-    if not USE_ADX_FILTER or dir_ == 0:
-        return True
-    adx = float(row[COL["h1_adx"]])
-    if np.isnan(adx) or adx < 0:
-        return False
-    if dir_ > 0:
-        return adx >= ADX_LONG_MIN
-    else:
-        return adx >= ADX_SHORT_MIN
-
-def volume_ok(row) -> bool:
-    if not USE_VOL_PCT:
-        return True
-    pct = float(row[COL["h1_vol_pct"]])
-    if np.isnan(pct):
-        return False
-    return (pct >= VOL_PCT_MIN) and (pct <= VOL_PCT_MAX)
-
-def obv_ok(row, dir_) -> bool:
-    if not USE_OBV_CONFIRM or dir_ == 0:
-        return True
-    obv = float(row[COL["h1_obv"]])
-    obv_sma = float(row[COL["h1_obv_sma"]])
-    slope = float(row[COL["h1_obv_slope"]])  # positive for up
-    if any(np.isnan(x) for x in (obv, obv_sma, slope)):
-        return False
-    if dir_ > 0:
-        return (obv >= obv_sma) and (slope > 0)
-    else:
-        return (obv <= obv_sma) and (slope < 0)
-
-# ---------- Position model ----------
-class Pos:
-    def __init__(self, side: int, entry_idx: int, entry_px: float, atr: float, eq: float):
-        self.side     = side              # +1 long, -1 short
-        self.entry_i  = entry_idx
-        self.entry_px = entry_px
-        self.atr      = atr
-        self.sl_pips  = (SL_ATR_R * atr) / PIP_SIZE
-        # risk sizing
-        if USE_RISK_PCT:
-            risk_usd  = eq * (RISK_PCT/100.0)
-            self.lots = max(0.01, risk_usd / max(1.0, self.sl_pips * PIP_USD))
+    # shorts blackout at start
+    if ok:
+        # hours since session start (wrap)
+        if h >= SESSION_START_H:
+            since_start = h - SESSION_START_H
         else:
-            self.lots = FIXED_LOTS
-        self.stop_px  = entry_px - self.side * self.sl_pips * PIP_SIZE
-        self.take_px  = None
-        self.be_done  = False
-        self.part1    = False
-        self.alive    = True
-        self.units    = self.lots  # one “lot” unit notion
+            since_start = (24 - SESSION_START_H) + h
+        # hours before end (wrap)
+        if h >= SESSION_END_H:
+            before_end = (24 - h) + SESSION_END_H
+        else:
+            before_end = SESSION_END_H - h
 
-    def r_now(self, px: float) -> float:
-        dist_pips = (px - self.entry_px) / PIP_SIZE * self.side
-        return dist_pips / max(1e-6, self.sl_pips)
+        if since_start < SHORT_BLACKOUT_FROM_START_H:
+            short_ok = False
+        if before_end <= SHORT_BLACKOUT_BEFORE_END_H:
+            short_ok = False
 
-def run_backtest(df: pd.DataFrame):
-    # ensure/derive columns
-    need = [COL["close"], COL["ema"], COL["h1_sma_fast"], COL["h1_sma_slow"],
-            COL["h1_adx"], COL["h1_atr"], COL["h1_vol_pct"], COL["h1_obv"], COL["h1_obv_sma"],
-            COL["h1_obv_slope"]]
-    for col in need:
-        if col not in df.columns:
-            raise ValueError(f"Missing required column: {col}")
+    return ok, long_ok, short_ok, h
 
-    # convenient numpy views
-    close = df[COL["close"]].to_numpy(np.float64)
-    ema   = df[COL["ema"]].to_numpy(np.float64)
-    h1atr = df[COL["h1_atr"]].to_numpy(np.float64)
+def _spread_filters(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    """Return (mask_pts, mask_ratio) for diagnostics and filtering."""
+    m_pts   = (df[COL["spread_pts"]].astype(float) <= MAX_SPREAD_POINTS)
+    # guard against zeros/NaNs
+    atr     = df[COL["atr"]].astype(float).replace(0.0, np.nan)
+    ratio   = (df[COL["spread_pts"]].astype(float) / atr).replace([np.inf, -np.inf], np.nan).fillna(np.inf)
+    m_ratio = (ratio <= SPREAD_TO_ATR_CAP)
+    return m_pts, m_ratio
 
-    ts = pd.to_datetime(df[COL["ts"]])
-    if ts.dt.tz is None:
-        ts = ts.dt.tz_localize("UTC")
-    else:
-        ts = ts.dt.tz_convert("UTC")
+def _regime_masks(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    fast = df[COL["sma_fast"]].astype(float)
+    slow = df[COL["sma_slow"]].astype(float)
+    long_ok  = fast > slow
+    short_ok = fast < slow
+    return long_ok, short_ok
 
+def _range_skip_masks(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    # Use your existing m15_spread_to_atr as a crude separateness proxy.
+    sep = df[COL["spread_atr"]].astype(float)
+    long_ok  = sep >= RANGE_SEP_ATR_LONG
+    short_ok = sep >= RANGE_SEP_ATR_SHORT
+    return long_ok, short_ok
 
-    equity = EQUITY_USD
-    open_pos: Optional[Pos] = None
-    last_long_i  = -10_000
-    last_short_i = -10_000
+def _adx_masks(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    adx = df[COL["adx"]].astype(float)
+    return (adx >= ADX_LONG_MIN), (adx >= ADX_SHORT_MIN)
 
-    trades = []  # list of dicts
+def _obv_confirm(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    # Simple confirm based on OBV slope sign; disable if not used/available
+    if (COL["obv_slope"] not in df.columns) or (not USE_OBV_CONFIRM):
+        n = len(df)
+        return pd.Series([True]*n, index=df.index), pd.Series([True]*n, index=df.index)
+    slope = df[COL["obv_slope"]].astype(float)
+    return (slope > 0), (slope < 0)
 
-    for i in range(1, len(df)):
-        row = df.iloc[i]
-        px  = close[i]
-        atr = h1atr[i]
-        if np.isnan(px) or atr <= 0:
-            # safety
-            if open_pos and (i - open_pos.entry_i) >= MAX_HOLD_BARS:
-                open_pos.alive = False
-            continue
+# =============== Trade simulation ===============
+def simulate_trades(df: pd.DataFrame, side: pd.Series) -> pd.DataFrame:
+    """
+    Simple 1-position engine:
+      - Enter on side change (0->1 for long, 0->-1 for short) at CLOSE
+      - SL = ATR * RISK_R; TP = ATR * TP_R
+      - Move to BE at +1R
+      - Optional trailing after TRAIL_START_R at ATR*TRAIL_ATR_MULT
+      - Exit on first SL/TP hit
+    Returns trades dataframe.
+    """
+    closes = df[COL["close"]].to_numpy(dtype=float)
+    atr    = df[COL["atr"]].to_numpy(dtype=float)
+    ts     = df[COL["ts"]].to_numpy(dtype="datetime64[ns]")
 
-        # manage exit/trailing for open position
-        if open_pos and open_pos.alive:
-            rnow = open_pos.r_now(px)
-            # BE
-            be_r = BE_R_LONG if open_pos.side > 0 else BE_R_SHORT
-            if (not open_pos.be_done) and rnow >= be_r:
-                spread_pips = float(row.get(COL["spread_pts"], 0.0)) if COL["spread_pts"] in row.index else 0.0
-                atr_pips    = atr / PIP_SIZE
-                buffer_pips = spread_pips + max(1.0, BE_ATR_BUFFER_FRAC * atr_pips)
-                be_px = open_pos.entry_px + open_pos.side * buffer_pips * PIP_SIZE
-                # never reduce beyond entry if negative buffer math
-                be_px = open_pos.entry_px + open_pos.side * max(0.0, (be_px - open_pos.entry_px) * open_pos.side)
-                open_pos.stop_px = max(open_pos.stop_px, be_px) if open_pos.side>0 else min(open_pos.stop_px, be_px)
-                open_pos.be_done = True
+    s      = side.to_numpy(dtype=int)
+    comm   = df.get(COL["commission"], pd.Series(0.0, index=df.index)).to_numpy(dtype=float)
 
-            # partial at 1.5R
-            if (not open_pos.part1) and rnow >= PARTIAL1_R:
-                # book partial; for PnL we’ll close that portion at current px
-                trades.append(dict(
-                    kind="partial", side=open_pos.side, entry_px=open_pos.entry_px, exit_px=px,
-                    entry_i=open_pos.entry_i, exit_i=i, lots=open_pos.units*(PARTIAL1_PCT/100.0)))
-                open_pos.units *= (1 - PARTIAL1_PCT/100.0)
-                open_pos.part1 = True
+    trades = []
+    pos = 0  # 0 none, +1 long, -1 short
+    entry_idx = None
+    entry = sl = tp = be_level = None
+    trail_on = False
 
-            # ATR trail after start R
-            startR = TRAIL_START_R_L if open_pos.side>0 else TRAIL_START_R_S
-            if rnow >= startR:
-                trail = atr * (ATR_MULT_L if open_pos.side>0 else ATR_MULT_S)
-                new_sl = px - open_pos.side * trail
-                open_pos.stop_px = max(open_pos.stop_px, new_sl) if open_pos.side>0 else min(open_pos.stop_px, new_sl)
+    for i in range(len(df)):
+        # manage open position
+        if pos != 0:
+            risk = atr[entry_idx] * RISK_R
+            if pos > 0:
+                # trailing?
+                if TRAIL_START_R > TP_R:
+                    # trailing only if > TP_R to avoid conflicting with TP
+                    # price move in R:
+                    move_r = (closes[i] - entry) / max(risk, 1e-12)
+                    if (not trail_on) and (move_r >= TRAIL_START_R):
+                        trail_on = True
+                    if trail_on:
+                        sl = max(sl, closes[i] - atr[i]*TRAIL_ATR_MULT)
 
-            # max hold
-            if (i - open_pos.entry_i) >= MAX_HOLD_BARS:
-                # time-based exit
-                trades.append(dict(kind="exit_time", side=open_pos.side, entry_px=open_pos.entry_px, exit_px=px,
-                                   entry_i=open_pos.entry_i, exit_i=i, lots=open_pos.units))
-                open_pos.alive = False
-                open_pos = None
+                # BE move
+                if be_level is None and (closes[i] - entry) >= risk * MOVE_BE_AT_R:
+                    be_level = entry
+                    sl = max(sl, be_level)
+
+                # check exits
+                hit_tp = closes[i] >= tp
+                hit_sl = closes[i] <= sl
+                if hit_tp or hit_sl:
+                    exit_px = tp if hit_tp else sl
+                    r = (exit_px - entry) / max(risk, 1e-12)
+                    trades.append({
+                        "entry_time": ts[entry_idx], "exit_time": ts[i],
+                        "side": "long", "entry": entry, "exit": exit_px,
+                        "R": r, "pnl": r, "commission": comm[i]
+                    })
+                    pos = 0; entry_idx = None; trail_on = False; be_level = None
+                    continue
+
+            else:  # short
+                if TRAIL_START_R > TP_R:
+                    move_r = (entry - closes[i]) / max(risk, 1e-12)
+                    if (not trail_on) and (move_r >= TRAIL_START_R):
+                        trail_on = True
+                    if trail_on:
+                        sl = min(sl, closes[i] + atr[i]*TRAIL_ATR_MULT)
+
+                if be_level is None and (entry - closes[i]) >= risk * MOVE_BE_AT_R:
+                    be_level = entry
+                    sl = min(sl, be_level)
+
+                hit_tp = closes[i] <= tp
+                hit_sl = closes[i] >= sl
+                if hit_tp or hit_sl:
+                    exit_px = tp if hit_tp else sl
+                    r = (entry - exit_px) / max(risk, 1e-12)
+                    trades.append({
+                        "entry_time": ts[entry_idx], "exit_time": ts[i],
+                        "side": "short", "entry": entry, "exit": exit_px,
+                        "R": r, "pnl": r, "commission": comm[i]
+                    })
+                    pos = 0; entry_idx = None; trail_on = False; be_level = None
+                    continue
+
+        # open new position
+        if pos == 0 and s[i] != 0:
+            pos = s[i]
+            entry_idx = i
+            entry = closes[i]
+            risk = atr[i] * RISK_R
+            if pos > 0:
+                sl = entry - risk
+                tp = entry + risk * TP_R
             else:
-                # stop hit?
-                if (open_pos.side>0 and px <= open_pos.stop_px) or (open_pos.side<0 and px >= open_pos.stop_px):
-                    trades.append(dict(kind="stop", side=open_pos.side, entry_px=open_pos.entry_px, exit_px=open_pos.stop_px,
-                                       entry_i=open_pos.entry_i, exit_i=i, lots=open_pos.units))
-                    open_pos.alive = False
-                    open_pos = None
+                sl = entry + risk
+                tp = entry - risk * TP_R
+            be_level = None
+            trail_on = False
 
-        # entry logic only if flat or effectively flat (we enforce single position)
-        if open_pos is None:
-            session_ok, long_ok, short_ok, _ = in_session_myt(ts.iloc[i])
-            if not session_ok: 
-                continue
-            if not spread_ok(row): 
-                continue
-            if not spread_vs_atr_ok(row): 
-                continue
+    return pd.DataFrame(trades)
 
-            dir_ = trend_with_range(row)
-            if dir_ == 0: 
-                continue
-            if not adx_ok(row, dir_): 
-                continue
-            if not volume_ok(row):
-                continue
-            if not obv_ok(row, dir_):
-                continue
+# =============== Main backtest ===============
+def run_backtest(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
+    df = _ensure_cols(df)
 
-            # M15 alignment & pullback
-            align_long  = close[i] > ema[i]
-            align_short = close[i] < ema[i]
-            pullback_atr = abs(close[i] - ema[i]) / max(1e-8, atr)
+    # Spread filters (and diagnostics)
+    m_pts, m_ratio = _spread_filters(df)
+    ratio = (df[COL["spread_pts"]].astype(float) /
+             df[COL["atr"]].astype(float).replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan)
 
-            # min distance since last same-side entry (in ATR)
-            def dist_since_last(side, last_i):
-                if last_i < 0: 
-                    return np.inf
-                return abs(close[i] - close[last_i]) / max(1e-8, atr)
+    print("\n=== Spread/ATR diagnostics (all bars) ===")
+    print(ratio.dropna().describe(percentiles=[.1,.25,.5,.75,.9,.95]).to_string())
+    removed_ratio = (ratio > SPREAD_TO_ATR_CAP).sum()
+    kept_ratio    = (ratio <= SPREAD_TO_ATR_CAP).sum()
+    print(f"Cap = {SPREAD_TO_ATR_CAP} → kept {kept_ratio:,}, removed {removed_ratio:,} "
+          f"({removed_ratio/(kept_ratio+removed_ratio+1e-9):.1%} removed)")
+    removed_pts = (~m_pts).sum()
+    kept_pts    = (m_pts).sum()
+    print(f"MAX_SPREAD_POINTS = {MAX_SPREAD_POINTS} → kept {kept_pts:,}, removed {removed_pts:,} "
+          f"({removed_pts/(kept_pts+removed_pts+1e-9):.1%} removed)")
 
-            if dir_ > 0 and long_ok and align_long:
-                if (i - last_long_i) >= MIN_BARS_BETWEEN_LONG \
-                   and pullback_atr >= MIN_PULLBACK_ATR_LONG \
-                   and dist_since_last(+1, last_long_i) >= MIN_ENTRY_DIST_ATR_LONG:
-                    # enter long
-                    p = Pos(+1, i, close[i] + SLIPPAGE_PIPS*PIP_SIZE, atr, equity)
-                    open_pos = p
-                    last_long_i = i
-            elif dir_ < 0 and short_ok and align_short:
-                if (i - last_short_i) >= MIN_BARS_BETWEEN_SHORT \
-                   and pullback_atr >= MIN_PULLBACK_ATR_SHORT \
-                   and dist_since_last(-1, last_short_i) >= MIN_ENTRY_DIST_ATR_SHORT:
-                    p = Pos(-1, i, close[i] - SLIPPAGE_PIPS*PIP_SIZE, atr, equity)
-                    open_pos = p
-                    last_short_i = i
+    # Base mask (always apply spread constraints)
+    base = m_pts & m_ratio
 
-    # Flush any open position at last price
-    if open_pos and open_pos.alive:
-        trades.append(dict(kind="final", side=open_pos.side, entry_px=open_pos.entry_px, exit_px=close[-1],
-                           entry_i=open_pos.entry_i, exit_i=len(df)-1, lots=open_pos.units))
-        open_pos = None
+    # Session mask
+    if USE_SESSION:
+        # If you have ready-made session booleans, use them:
+        session_ok = (df[COL["asia"]] | df[COL["london"]] | df[COL["ny"]]).astype(bool)
+        # refine with blackout logic by hour in MYT
+        session_flags = []
+        for ts in df[COL["ts"]]:
+            ok, long_ok_s, short_ok_s, _ = in_my_session(ts)
+            session_flags.append((ok, long_ok_s, short_ok_s))
+        session_flags = np.array(session_flags, dtype=object)
+        session_ok = session_ok & pd.Series([x[0] for x in session_flags], index=df.index)
+        long_session_ok  = pd.Series([x[1] for x in session_flags], index=df.index)
+        short_session_ok = pd.Series([x[2] for x in session_flags], index=df.index)
+    else:
+        n = len(df)
+        session_ok      = pd.Series([True]*n, index=df.index)
+        long_session_ok = pd.Series([True]*n, index=df.index)
+        short_session_ok= pd.Series([True]*n, index=df.index)
 
-    # ---------- PnL & metrics ----------
-    if not trades:
-        print("No trades.")
-        return
+    # Regime masks
+    if USE_REGIME_FILTER:
+        reg_long, reg_short = _regime_masks(df)
+    else:
+        n = len(df)
+        reg_long = pd.Series([True]*n, index=df.index)
+        reg_short= pd.Series([True]*n, index=df.index)
 
-    out = []
-    wins = 0
-    loss = 0
-    gross_p = 0.0
-    gross_l = 0.0
+    # Range-separation masks
+    if USE_RANGE_SKIP:
+        rng_long, rng_short = _range_skip_masks(df)
+    else:
+        n = len(df)
+        rng_long = pd.Series([True]*n, index=df.index)
+        rng_short= pd.Series([True]*n, index=df.index)
 
-    comm = df.get(COL["comm_usd"])
-    comm_per_round = float(comm.iloc[0]) if comm is not None else 0.0
+    # ADX masks
+    if USE_ADX_FILTER:
+        adx_long, adx_short = _adx_masks(df)
+    else:
+        n = len(df)
+        adx_long  = pd.Series([True]*n, index=df.index)
+        adx_short = pd.Series([True]*n, index=df.index)
 
-    for t in trades:
-        side = t["side"]
-        pips = (t["exit_px"] - t["entry_px"]) / PIP_SIZE * side
-        pnl  = pips * PIP_USD * t["lots"]
-        if t["kind"] in ("stop", "final", "exit_time", "partial"):
-            # charge commission on full round (very rough; adjust to your broker math)
-            pnl -= comm_per_round
-        out.append(dict(ts_entry=str(ts.iloc[t["entry_i"]]), ts_exit=str(ts.iloc[t["exit_i"]]),
-                        side="long" if side>0 else "short", kind=t["kind"], pips=pips, pnl=pnl))
-        if pnl > 0: 
-            wins += 1; gross_p += pnl
-        else:
-            loss += 1; gross_l += -pnl
+    # OBV confirm
+    obv_long, obv_short = _obv_confirm(df)
 
-    trades_df = pd.DataFrame(out)
-    trades_df.to_csv(RESULTS_DIR/"trades_rules.csv", index=False)
+    # Final long/short eligibility
+    long_ok  = base & session_ok & long_session_ok & reg_long & rng_long & adx_long & obv_long
+    short_ok = base & session_ok & short_session_ok & reg_short & rng_short & adx_short & obv_short
 
-    winrate = 100.0 * wins / max(1, wins+loss)
-    pf = (gross_p / max(1e-9, gross_l)) if gross_l>0 else np.inf
-    dd = compute_max_dd(trades_df["pnl"].to_numpy(np.float64))
+    # Signal: enter when eligible (no smoothing for now)
+    side = pd.Series(0, index=df.index, dtype=int)
+    side[long_ok]  =  1
+    side[short_ok] = -1
 
-    print("Backtest completed (rules only)")
-    print(f"Total trades : {len(trades_df):,}")
-    print(f"Win rate     : {winrate:.2f}%")
-    print(f"Profit factor: {pf:.2f}")
-    print(f"Max drawdown : {dd:,.2f} USD")
-    print(f"Average R    : {trades_df['pips'].mean() / (SL_ATR_R*(df[COL['h1_atr']]/PIP_SIZE).median()):.2f}")
+    # Optional: ensure no simultaneous long & short (prefer none on ties)
+    both = long_ok & short_ok
+    side[both] = 0
 
-    summary = dict(total_trades=int(len(trades_df)), winrate_pct=winrate, profit_factor=float(pf),
-                   max_drawdown_usd=float(dd))
-    with open(RESULTS_DIR/"backtest_rules_summary.json", "w") as f:
+    # --- Debug counts
+    print("\n=== Backtest diagnostics ===")
+    print(f"pred_rows: {len(df):7d}")
+    print(f"session_ok: {int(session_ok.sum()):7d}")
+    print(f"reg_long:   {int(reg_long.sum()):7d}   reg_short: {int(reg_short.sum()):7d}")
+    print(f"rng_long:   {int(rng_long.sum()):7d}   rng_short: {int(rng_short.sum()):7d}")
+    print(f"adx_ok L/S: {int(adx_long.sum()):7d} / {int(adx_short.sum()):7d}")
+    print(f"spread_ok pts/ratio: {int(m_pts.sum()):7d} / {int(m_ratio.sum()):7d}")
+    print(f"take_long:  {int((side== 1).sum()):7d}")
+    print(f"take_short: {int((side==-1).sum()):7d}")
+
+    # Simulate trades
+    trades = simulate_trades(df, side)
+
+    # Apply commissions in R terms (optional; here we subtract USD-equivalent R ≈ commission/(ATR*value) – unknown tick value)
+    # Simpler: subtract commission as a flat R fraction of 1R risk at entry ATR; if you want exact $, keep R as-is and report PF separately.
+    # For clarity we keep R as-is; PF uses R as pnl unit.
+
+    # Summary
+    wins  = (trades["R"] > 0).sum()
+    loss  = (trades["R"] <= 0).sum()
+    wr    = wins / max(len(trades), 1)
+    pf    = trades.loc[trades["R"]>0, "R"].sum() / abs(trades.loc[trades["R"]<=0, "R"].sum() or 1e-12)
+    avg_r = trades["R"].mean() if len(trades) else 0.0
+
+    # equity and DD (in R)
+    eq = trades["R"].cumsum() if len(trades) else pd.Series([], dtype=float)
+    peak = eq.cummax() if len(eq) else eq
+    dd = (eq - peak).min() if len(eq) else 0.0
+
+    summary = {
+        "total_trades": int(len(trades)),
+        "win_rate": float(wr*100.0),
+        "profit_factor": float(pf),
+        "max_drawdown_R": float(abs(dd)),
+        "average_R": float(avg_r),
+        "params": {
+            "MAX_SPREAD_POINTS": MAX_SPREAD_POINTS,
+            "SPREAD_TO_ATR_CAP": SPREAD_TO_ATR_CAP,
+            "USE_SESSION": USE_SESSION,
+            "USE_REGIME_FILTER": USE_REGIME_FILTER,
+            "USE_RANGE_SKIP": USE_RANGE_SKIP,
+            "USE_ADX_FILTER": USE_ADX_FILTER,
+            "USE_OBV_CONFIRM": USE_OBV_CONFIRM,
+            "RISK_R": RISK_R, "TP_R": TP_R,
+            "MOVE_BE_AT_R": MOVE_BE_AT_R,
+            "TRAIL_START_R": TRAIL_START_R,
+            "TRAIL_ATR_MULT": TRAIL_ATR_MULT,
+        }
+    }
+
+    # Save outputs
+    if len(trades):
+        trades.to_csv(OUT_TRADES, index=False)
+    with open(OUT_SUMMARY, "w") as f:
         json.dump(summary, f, indent=2)
 
-def compute_max_dd(pnls: np.ndarray) -> float:
-    """Max drawdown on cumulative PnL."""
-    curve = pnls.cumsum()
-    peak  = np.maximum.accumulate(curve)
-    dd    = (curve - peak).min() if len(curve) else 0.0
-    return -float(dd)
+    # Print nice summary
+    print("\nBacktest completed (rules only)")
+    print(f"Total trades : {summary['total_trades']:7d}")
+    print(f"Win rate     : {summary['win_rate']:.2f}%")
+    print(f"Profit factor: {summary['profit_factor']:.2f}")
+    print(f"Max drawdown : {summary['max_drawdown_R']:.2f} R")
+    print(f"Average R    : {summary['average_R']:.2f}")
 
-# ------------------------- main -------------------------
-if __name__ == "__main__":
-    df = load_features()
-    print("Loaded features:", FEAT_PATH)
-    run_backtest(df)
+    # --- Add this block below ---
+    summary = {
+        "total_trades": summary.get("total_trades", 0),
+        "win_rate": summary.get("win_rate", 0.0),
+        "profit_factor": summary.get("profit_factor", 0.0),
+        "average_R": summary.get("average_R", 0.0),
+        "max_drawdown_R": summary.get("max_drawdown_R", 0.0),
+    }
+    return trades, summary
+    
+    if __name__ == "__main__":
+        df = pd.read_parquet(FEAT_PATH)
+        print(f"Loaded features: {FEAT_PATH}")
+        _ = run_backtest(df)
+
+        print(f"Average R      : {summary['average_R']:.2f}")
