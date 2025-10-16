@@ -1,0 +1,2 @@
+rows_total,accepted_rows,acceptance_rate,accuracy_all_rows,accuracy_on_accepted,pf_estimate_rr1,pred_Long,pred_Short,pred_None,real_Long,real_Short,real_None
+272957,257506,0.943394,0.250809,0.250845,0.334837,228304,29202,0,64976,63330,0

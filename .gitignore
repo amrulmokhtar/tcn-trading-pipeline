@@ -74,3 +74,11 @@ figures/
 debug/
 scratch/
 local_test/
+
+# Backtest outputs
+results/*.csv
+results/*.json
+
+# Phase / experimental scripts backups
+scripts/phase*_*.bak
+scripts/phase*_diagnostic.py
