@@ -438,9 +438,27 @@ def run_backtest(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     }
     return trades, summary
     
-    if __name__ == "__main__":
-        df = pd.read_parquet(FEAT_PATH)
-        print(f"Loaded features: {FEAT_PATH}")
-        _ = run_backtest(df)
+if __name__ == "__main__":
+    import sys, traceback, pandas as pd
 
-        print(f"Average R      : {summary['average_R']:.2f}")
+    print("\n>>> phase5_backtest starting...", flush=True)
+    try:
+        print(f"FEAT_PATH = {FEAT_PATH}", flush=True)
+        df = pd.read_parquet(FEAT_PATH)
+        print(f"Loaded features OK: shape={df.shape}", flush=True)
+
+        trades, summary = run_backtest(df)
+
+        print("\nBacktest completed (rules only)", flush=True)
+        print(f"Total trades : {summary.get('total_trades', 0)}", flush=True)
+        wr = summary.get("win_rate", 0.0)
+        print(f"Win rate     : {wr*100:.2f}%", flush=True)
+        print(f"Profit factor: {summary.get('profit_factor', 0.0):.2f}", flush=True)
+        print(f"Max drawdown : {summary.get('max_drawdown_R', 0.0):.2f} R", flush=True)
+        print(f"Average R    : {summary.get('average_R', 0.0):.2f}", flush=True)
+
+        print(">>> phase5_backtest done.\n", flush=True)
+    except Exception as e:
+        print("\n!!! phase5_backtest crashed !!!", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
