@@ -49,7 +49,7 @@ USE_OBV_CONFIRM  = False  # True if you want an OBV slope confirm
 
 # =============== Spread constraints ===============
 MAX_SPREAD_POINTS = 30     # absolute points cap (tighten later)
-SPREAD_TO_ATR_CAP = 10     # <-- sweep 6..12 to find elbow; 10 is a good start
+SPREAD_TO_ATR_CAP = 20     # <-- sweep 6..20 to find elbow; 20 is a the best combo
 
 # =============== Session (Malaysia time) ===============
 TZ_OFFSET_H     = +8
@@ -414,32 +414,30 @@ def run_backtest(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         }
     }
 
+    # =========================
     # Save outputs
+    # =========================
     if len(trades):
         trades.to_csv(OUT_TRADES, index=False)
-    with open(OUT_SUMMARY, "w") as f:
-        json.dump(summary, f, indent=2)
+        with open(OUT_SUMMARY, "w") as f:
+            json.dump(summary, f, indent=2)
 
-    # Print nice summary
-    print("\nBacktest completed (rules only)")
-    print(f"Total trades : {summary['total_trades']:7d}")
-    print(f"Win rate     : {summary['win_rate']:.2f}%")
-    print(f"Profit factor: {summary['profit_factor']:.2f}")
-    print(f"Max drawdown : {summary['max_drawdown_R']:.2f} R")
-    print(f"Average R    : {summary['average_R']:.2f}")
+    # (Removed the duplicate "pretty prints" here to avoid printing twice)
+    # If you prefer prints inside run_backtest instead of __main__, you can
+    # re-enable them—but then comment the prints in __main__ below.
 
-    # --- Add this block below ---
-    summary = {
-        "total_trades": summary.get("total_trades", 0),
-        "win_rate": summary.get("win_rate", 0.0),
-        "profit_factor": summary.get("profit_factor", 0.0),
-        "average_R": summary.get("average_R", 0.0),
-        "max_drawdown_R": summary.get("max_drawdown_R", 0.0),
-    }
+
+    # Make sure the function returns both objects
     return trades, summary
+
+# =========================
+# CLI entry
+# =========================
     
 if __name__ == "__main__":
-    import sys, traceback, pandas as pd
+    import sys
+    import traceback
+    import pandas as pd
 
     print("\n>>> phase5_backtest starting...", flush=True)
     try:
@@ -447,18 +445,28 @@ if __name__ == "__main__":
         df = pd.read_parquet(FEAT_PATH)
         print(f"Loaded features OK: shape={df.shape}", flush=True)
 
+        # Run once; run_backtest no longer prints a second time
         trades, summary = run_backtest(df)
 
+        # Single, clean summary (note: win_rate already in percent)
         print("\nBacktest completed (rules only)", flush=True)
         print(f"Total trades : {summary.get('total_trades', 0)}", flush=True)
-        wr = summary.get("win_rate", 0.0)
-        print(f"Win rate     : {wr*100:.2f}%", flush=True)
+        print(f"Win rate     : {summary.get('win_rate', 0.0):.2f}%", flush=True)  # <-- no *100
         print(f"Profit factor: {summary.get('profit_factor', 0.0):.2f}", flush=True)
         print(f"Max drawdown : {summary.get('max_drawdown_R', 0.0):.2f} R", flush=True)
         print(f"Average R    : {summary.get('average_R', 0.0):.2f}", flush=True)
 
+        # Persist summary again (redundant but harmless if you like a final write)
+        try:
+            with open(OUT_SUMMARY, "w") as f:
+                json.dump(summary, f, indent=2)
+        except Exception:
+            # Don't crash the run if a final write fails
+            print("(warn) could not write final summary JSON", flush=True)
+
         print(">>> phase5_backtest done.\n", flush=True)
-    except Exception as e:
+
+    except Exception:
         print("\n!!! phase5_backtest crashed !!!", flush=True)
         traceback.print_exc()
         sys.exit(1)
