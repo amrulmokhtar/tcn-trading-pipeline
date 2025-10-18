@@ -51,12 +51,16 @@ def to_utc_series(ts_like: pd.Series) -> pd.Series:
     return ts
 
 def add_time_columns(df: pd.DataFrame, ts_col: str) -> pd.DataFrame:
-    if ts_col in df.columns:
-        ts_utc = to_utc_series(df[ts_col])
-    else:
-        warnings.warn(f"Timestamp column '{ts_col}' not found, synthetic timestamps will be generated.")
-        ts_utc = pd.date_range("2000-01-01", periods=len(df), freq="15min", tz="UTC")
     df = df.copy()
+    if ts_col in df.columns:
+        ts_utc = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
+        # if most values are NaT, synthesize a timeline
+        if ts_utc.isna().mean() > 0.5:
+            ts_utc = pd.date_range("2020-01-01", periods=len(df), freq="15min", tz="UTC")
+    else:
+        # no ts col, synthesize
+        ts_utc = pd.date_range("2020-01-01", periods=len(df), freq="15min", tz="UTC")
+
     df["timestamp_utc"] = ts_utc
     df["timestamp_myt"] = ts_utc + pd.Timedelta(hours=TZ_OFFSET_HOURS)
     return df
@@ -142,7 +146,8 @@ def align_features(
         dropped_cols = [c for c in X.columns if c not in used_cols]
         X = X[used_cols]
     elif isinstance(n_expected, int):
-        ordered = sorted(list(X.columns))
+        # keep original dataframe order instead of sorting alphabetically
+        ordered = list(X.columns)
         used_cols = ordered[:n_expected]
         dropped_cols = [c for c in X.columns if c not in used_cols]
         X = X[used_cols]
@@ -156,123 +161,55 @@ def align_features(
     return X, used_cols, dropped_cols
 
 # --------------- model loader ---------------
-
 def load_model(model_path: Path, input_dim: int = None, num_classes: int = 3):
-    """
-    Try TorchScript first, then rebuild TCNClassifier from your training file and load a state_dict.
-    Constructor args are detected dynamically. Handles aliases like in_ch, in_channels, out_ch, n_classes.
-    """
-    import inspect, importlib.util, sys as _sys
+    import torch
+    from scripts.phase4_train_tcn import TCNClassifier
 
-    # TorchScript path
-    try:
-        m = torch.jit.load(str(model_path), map_location="cpu")
-        m.eval()
-        return m, "torchscript"
-    except Exception:
-        pass
-
-    # Import TCNClassifier from training code, with file based fallback
-    TCNClassifier = None
-    try:
-        from scripts.phase4_train_tcn import TCNClassifier as _TCN
-        TCNClassifier = _TCN
-    except Exception:
-        spec = importlib.util.spec_from_file_location(
-            "phase4_train_tcn", _ROOT / "scripts" / "phase4_train_tcn.py"
-        )
-        if spec and spec.loader:
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            TCNClassifier = getattr(mod, "TCNClassifier", None)
-    if TCNClassifier is None:
-        raise RuntimeError("Could not import TCNClassifier from scripts.phase4_train_tcn")
-
-    # Load checkpoint
+    # load checkpoint
     ckpt = torch.load(str(model_path), map_location="cpu")
+
+    # raw torch module case
     if isinstance(ckpt, torch.nn.Module):
         ckpt.eval()
         return ckpt, "raw_module"
+
+    # normalize to a state_dict
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         sd = ckpt["state_dict"]
+        meta = {}
+    elif isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], dict):
+        # Phase 4 saved {"model": state_dict, "in_ch": ..., "n_classes": ..., "channels": ..., "dropout": ...}
+        sd = ckpt["model"]
+        meta = ckpt
     elif isinstance(ckpt, dict):
         sd = ckpt
+        meta = {}
     else:
         raise RuntimeError(f"Unsupported checkpoint type, {type(ckpt)}")
 
-    # Inspect constructor
-    sig = inspect.signature(TCNClassifier.__init__)
-    params = list(sig.parameters.values())[1:]  # skip self
-    names = [p.name for p in params]
-    required = {p.name for p in params if p.default is inspect._empty and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)}
+    # pull hyperparams from checkpoint when available
+    in_ch = meta.get("in_ch", input_dim)
+    n_cls = meta.get("n_classes", num_classes)
+    channels = meta.get("channels", [64, 64, 64])
+    dropout = meta.get("dropout", 0.15)
 
-    # Map aliases
-    alias_values = {
-        # input size
-        "input_dim": input_dim, "in_dim": input_dim, "in_ch": input_dim, "in_channels": input_dim,
-        "n_inputs": input_dim, "num_features": input_dim, "in_features": input_dim, "features": input_dim,
-        # class count
-        "num_classes": num_classes, "n_classes": num_classes, "classes": num_classes, "out_ch": num_classes, "out_channels": num_classes,
-        # common hyper params
-        "channels": [64, 64, 64], "dropout": 0.15,
-    }
+    if in_ch is None:
+        raise ValueError("input_dim is None and checkpoint does not contain 'in_ch'")
 
-    kwargs = {}
-    for n in names:
-        if n in alias_values and alias_values[n] is not None:
-            kwargs[n] = alias_values[n]
+    # build the model same way as Phase 4
+    model = TCNClassifier(in_ch=in_ch, n_classes=n_cls, channels=channels, dropout=dropout)
 
-    # Ensure required keys are present, fill minimum set
-    if "channels" in required and "channels" not in kwargs:
-        kwargs["channels"] = [64, 64, 64]
-    if any(k in required for k in ("in_ch", "in_channels", "input_dim", "in_dim")) and not any(k in kwargs for k in ("in_ch","in_channels","input_dim","in_dim")):
-        if input_dim is None:
-            raise RuntimeError("Model constructor requires input dimension but input_dim is None")
-        # prefer in_ch
-        if "in_ch" in names:
-            kwargs["in_ch"] = input_dim
-        elif "in_channels" in names:
-            kwargs["in_channels"] = input_dim
-        elif "input_dim" in names:
-            kwargs["input_dim"] = input_dim
-
-    if any(k in required for k in ("out_ch", "out_channels", "num_classes", "n_classes", "classes")) and not any(k in kwargs for k in ("out_ch","out_channels","num_classes","n_classes","classes")):
-        if "out_ch" in names:
-            kwargs["out_ch"] = num_classes
-        elif "out_channels" in names:
-            kwargs["out_channels"] = num_classes
-        elif "num_classes" in names:
-            kwargs["num_classes"] = num_classes
-        elif "n_classes" in names:
-            kwargs["n_classes"] = num_classes
-        elif "classes" in names:
-            kwargs["classes"] = num_classes
-
-    # Build model
-    try:
-        model = TCNClassifier(**kwargs)
-    except TypeError:
-        # last resort positional, order the classic trio, in_ch, channels, out_ch if present
-        pos = []
-        if "in_ch" in names or "in_channels" in names or "input_dim" in names or "in_dim" in names:
-            pos.append(input_dim)
-        if "channels" in names:
-            pos.append([64, 64, 64])
-        if "out_ch" in names or "out_channels" in names or "num_classes" in names or "n_classes" in names or "classes" in names:
-            pos.append(num_classes)
-        model = TCNClassifier(*pos)
-
-    # Load weights
+    # load weights
     missing, unexpected = model.load_state_dict(sd, strict=False)
-    if missing or unexpected:
-        print(f"[load_state_dict] missing={len(missing)} unexpected={len(unexpected)}")
-        if missing:
-            print("  missing keys sample:", missing[:5])
-        if unexpected:
-            print("  unexpected keys sample:", unexpected[:5])
+    print(f"[load_state_dict] missing={len(missing)} unexpected={len(unexpected)}")
+    if missing:
+        print(" missing keys sample:", missing[:5])
+    if unexpected:
+        print(" unexpected keys sample:", unexpected[:5])
 
     model.eval()
     return model, "state_dict"
+
 
 # --------------- main ---------------
 
