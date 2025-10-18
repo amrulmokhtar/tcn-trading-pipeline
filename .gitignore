@@ -1,57 +1,42 @@
-# --- Python ---
+# =========================
+# Python and Environment
+# =========================
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-*.pdb
-*.so
-*.egg
-*.egg-info/
-dist/
-build/
-.eggs/
-
-# --- Environments ---
-.env
+*$py.class
 .venv/
-venv/
-ENV/
-env.bak/
+.venv*/
+.env
+.env*/
+.envrc
 *.env
-
-# --- Jupyter / Notebooks ---
-.ipynb_checkpoints
-*.ipynb_checkpoints/
-
-# --- Data files ---
-data/*.csv
-data/*.parquet
-data/*.npz
-data/*.pkl
-data/*.json
-*.db
-*.sqlite3
-
-# --- Logs / Temp ---
 *.log
-logs/
-tmp/
-temp/
-.cache/
 *.bak
-*.swp
 
-# --- VSCode / IDE ---
+# =========================
+# IDE and OS Files
+# =========================
 .vscode/
 .idea/
-*.code-workspace
-
-# --- OS files ---
+*.swp
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# --- Model artifacts ---
+# =========================
+# Data and Intermediate Files
+# =========================
+data/
+*.csv
+*.parquet
+*.npz
+*.pkl
+*.json
+!models/SCALER.json     # allow only scaler JSON to be tracked
+
+# =========================
+# Model Artifacts
+# =========================
 *.h5
 *.ckpt
 *.onnx
@@ -60,25 +45,56 @@ desktop.ini
 models/
 checkpoints/
 runs/
+!models/SCALER.json     # explicitly re-allow scaler JSON
 
-# --- Generated plots / images ---
-*.png
-*.jpg
-*.jpeg
-*.gif
-outputs/
+# =========================
+# Output and Results
+# =========================
+results/
+logs/
+reports/
 plots/
-figures/
+backtests/
+exports/
 
-# --- Custom local scripts / debug ---
-debug/
-scratch/
-local_test/
+# =========================
+# Temporary / Backup Files
+# =========================
+*.tmp
+*.temp
+*.old
+*.orig
+*.backup
+*.bak
 
-# Backtest outputs
-results/*.csv
-results/*.json
-
-# Phase / experimental scripts backups
+# =========================
+# Project Scripts Control
+# =========================
+# ignore experimental and backups
 scripts/phase*_*.bak
 scripts/phase*_diagnostic.py
+
+# explicitly include your main working scripts
+!scripts/phase6_ml_backtest.py
+!scripts/phase6_hybrid_backtest.py
+!generate_phase_summary.py
+
+# =========================
+# Documents and Office Files
+# =========================
+*.doc
+*.docx
+*.pdf
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+
+# =========================
+# Misc
+# =========================
+__MACOSX/
+*.zip
+*.tar
+*.gz
+*.7z
