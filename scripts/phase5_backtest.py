@@ -48,17 +48,17 @@ COL = {
 # Default filter toggles
 # =========================
 USE_SESSION      = True
-USE_REGIME       = True
+USE_REGIME       = False
 USE_RANGE_SKIP   = True
 USE_ADX_FILTER   = True
-USE_OBV_PCT      = False
-USE_OBV_CONFIRM  = False
+USE_OBV_PCT      = True
+USE_OBV_CONFIRM  = True
 
 # =========================
 # Default spread constraints
 # =========================
 MAX_SPREAD_POINTS  = 30
-SPREAD_TO_ATR_CAP  = 10.0
+SPREAD_TO_ATR_CAP  = 20
 
 # =========================
 # Session, Malaysia time
