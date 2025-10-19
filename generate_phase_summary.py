@@ -1,215 +1,192 @@
-# generate_phase_summary.py
-# Generates a Word document summarizing Phase 0–5, lessons learned, achievements,
-# best parameters/strategy notes, and adds a Phase 0→10 roadmap table.
+# scripts/generate_phase_summary.py
+# Builds results/Phase0_to_Phase6_Summary_with_Lessons.docx from your Phase 0–6 artifacts
 
-from docx import Document
-from docx.shared import Pt, Inches
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 from pathlib import Path
 from datetime import datetime
+import json, math
+import pandas as pd
 
-# ---------- Output path ----------
-OUT_DIR = Path("results")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-OUT_FILE = OUT_DIR / "Phase0_to_Phase5_Summary_with_Lessons.docx"
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-# ---------- Helpers ----------
-def add_title(doc: Document, text: str):
-    h = doc.add_heading(text, level=0)
-    h.alignment = WD_ALIGN_PARAGRAPH.CENTER
+RESULTS = Path("results")
+RESULTS.mkdir(parents=True, exist_ok=True)
 
-def add_kv_para(doc: Document, key: str, val: str):
-    p = doc.add_paragraph()
-    r1 = p.add_run(f"{key}: ")
-    r1.bold = True
-    p.add_run(val)
+# ---------- helpers ----------
+def load_json(p: Path):
+    try:
+        with open(p, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-def add_table(doc: Document, headers, rows, col_widths_in=None):
-    table = doc.add_table(rows=1, cols=len(headers))
-    table.style = "Table Grid"
-    hdr = table.rows[0].cells
-    for i, h in enumerate(headers):
-        hdr[i].text = h
+def pct(x):
+    if x is None: return ""
+    try:
+        x = float(x)
+        return f"{x*100:.2f}%" if x <= 1 else f"{x:.2f}%"
+    except Exception:
+        return str(x)
+
+def row_from(d: dict):
+    return [
+        d.get("total_trades", d.get("Total trades","")),
+        pct(d.get("win_rate", d.get("Win rate",""))),
+        d.get("profit_factor", d.get("PF","")),
+        d.get("avg_r", d.get("Average R","")),
+        d.get("expected_value_r", d.get("Expected Val. R", d.get("Expected Value",""))),
+        d.get("max_drawdown_r", d.get("Max drawdown","")),
+    ]
+
+def add_table(doc, headers, rows):
+    t = doc.add_table(rows=1, cols=len(headers))
+    t.style = "Table Grid"
+    for i,h in enumerate(headers): t.rows[0].cells[i].text = h
     for row in rows:
-        cells = table.add_row().cells
-        for i, v in enumerate(row):
-            cells[i].text = str(v)
-    if col_widths_in:
-        for col_i, w in enumerate(col_widths_in):
-            for row in table.rows:
-                row.cells[col_i].width = Inches(w)
-    return table
+        cells = t.add_row().cells
+        for i,val in enumerate(row):
+            cells[i].text = "" if val is None else str(val)
+    return t
 
-# ---------- Build document ----------
+# ---------- locate inputs ----------
+rules_summary = RESULTS / "backtest_summary.json"                # rules only
+ml_summary    = RESULTS / "phase6_ml_summary.json"               # ml only
+hyb_summary   = RESULTS / "phase6_hybrid_summary.json"           # hybrid
+hyb_trades    = RESULTS / "phase6_hybrid_trades.csv"             # for risk metrics
+hyb_sessions  = RESULTS / "phase6_hybrid_session_summary.csv"    # optional appendix
+
+rules = load_json(rules_summary) if rules_summary.exists() else {}
+ml    = load_json(ml_summary)    if ml_summary.exists()    else {}
+hyb   = load_json(hyb_summary)   if hyb_summary.exists()   else {}
+
+# ---------- build doc ----------
 doc = Document()
 
-# Title
-add_title(doc, "TCN_1.0 — Phase 0 to Phase 5 Summary")
+# title
+h = doc.add_heading("TCN_1.0, Phase 0 to Phase 6, Summary and Lessons", level=0)
+h.alignment = WD_ALIGN_PARAGRAPH.CENTER
+p = doc.add_paragraph()
+p.add_run(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}").italic = True
 
-# Metadata
-doc.add_paragraph().add_run(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}").italic = True
-doc.add_paragraph().add_run("Branch: pre_ml").italic = True
-
-# 1. Overview
+# overview
 doc.add_heading("1. Overview", level=1)
 doc.add_paragraph(
-    "This document summarizes the progress from Phase 0 through Phase 5 of the TCN_1.0 project, "
-    "including environment setup, data preparation, feature engineering, initial model training, "
-    "and rule-based backtesting with diagnostics and Expected Value (EV). It also includes lessons learned, "
-    "current best-known parameters for the pre-ML rules, and the roadmap through Phase 10."
+    "Phases 0 to 6 completed, data prepared, rules backtests built with EV, "
+    "TCN predictions integrated, and a hybrid backtest produced stable results under a common cost model."
 )
 
-# 1.1 Development Phases Overview (0→10)
-doc.add_heading("1.1 Development Phases Overview (Phase 0 → 10)", level=2)
-phases_overview = [
-    ("Phase 0",  "Environment Setup",             "Git repo, venv, structure, deps"),
-    ("Phase 1",  "Data Cleaning",                 "15m/1h historical prep & alignment"),
-    ("Phase 2",  "Feature Engineering",           "ATR/EMA/ADX/OBV, sessions, volume flow"),
-    ("Phase 3",  "Dataset Assembly",              "Merged, ML-ready parquet"),
-    ("Phase 4",  "Model Training (Prototype)",    "Baseline TCN + scaler persistence"),
-    ("Phase 5",  "Backtest + EV Tracking",        "Rules engine, diagnostics, grid sweeps"),
-    ("Phase 6",  "ML Integration",                "Hybrid classifier (TCN/LightGBM), EV-weighted"),
-    ("Phase 7",  "Real-Time Signal Service",      "Rolling feature inference in Python"),
-    ("Phase 8",  "MT5 Bridge Integration",        "ZeroMQ or CSV bridge, order mgmt"),
-    ("Phase 9",  "Monitoring & Risk Analytics",   "Live drift, PnL, DD, exposures"),
-    ("Phase 10", "Packaging & CI/CD",             "Versioned release, cloud backtests"),
+# phases list
+doc.add_heading("2. Phases 0 to 6, highlights", level=1)
+phases = [
+    ("Phase 0", "Environment and repo, virtual env, dependencies, results layout"),
+    ("Phase 1", "Data cleaning, timestamp alignment, synthetic timestamps when missing"),
+    ("Phase 2", "Feature engineering, ATR, EMA, ADX, OBV, sessions, regime flags"),
+    ("Phase 3", "Dataset assembly, model ready frame, metadata saved"),
+    ("Phase 4", "Prototype TCN, scaler persisted to models"),
+    ("Phase 5", "Rules backtests with EV, grid and filter sweeps, diagnostics"),
+    ("Phase 6", "ML predictions and Hybrid backtest, probability gating on rules"),
 ]
-add_table(
-    doc,
-    headers=["Phase", "Focus", "Deliverable"],
-    rows=phases_overview,
-    col_widths_in=[1.2, 2.2, 3.4],
-)
-doc.add_paragraph("Current Progress: ✅ Phases 0–5 completed. 🚧 Phases 6–10 upcoming (ML, live service, MT5, CI/CD).")
+t = doc.add_table(rows=1, cols=3); t.style="Table Grid"
+t.rows[0].cells[0].text="Phase"; t.rows[0].cells[1].text="Focus"; t.rows[0].cells[2].text="Notes"
+for a,b in phases:
+    r = t.add_row().cells
+    r[0].text=a; r[1].text=b; r[2].text=""
 
-# 2. Phase-by-Phase (0–5)
-doc.add_heading("2. Phase-by-Phase Summary (0 → 5)", level=1)
+# results table
+doc.add_heading("3. Results summary", level=1)
+hdr = ["System","Trades","Win Rate","Profit Factor","Avg R","EV (R)","Max DD (R)"]
+tbl = doc.add_table(rows=1, cols=len(hdr)); tbl.style="Table Grid"
+for i,hc in enumerate(hdr): tbl.rows[0].cells[i].text = hc
+for sys, data in [
+    ("Rules only", row_from(rules)),
+    ("ML only",    row_from(ml)),
+    ("Hybrid",     row_from(hyb)),
+]:
+    cells = tbl.add_row().cells
+    cells[0].text = sys
+    for i,v in enumerate(data, start=1):
+        cells[i].text = "" if v is None else str(v)
 
-# Phase 0
-doc.add_heading("Phase 0 — Environment Setup", level=2)
+# risk metrics from hybrid trades
+doc.add_heading("3.1 Risk metrics, Hybrid", level=2)
+if hyb_trades.exists():
+    d = pd.read_csv(hyb_trades)
+    r = d["R"] if "R" in d.columns else d.get("R_net", pd.Series([0.0]*len(d)))
+    cum = r.cumsum()
+    dd = (cum.cummax() - cum).max()
+    final_cum_r = float(cum.iloc[-1]) if len(cum) else 0.0
+    sharpe = float((r.mean() / r.std()) * 252**0.5) if r.std() else float("nan")
+    neg_std = r[r < 0].std()
+    sortino = float((r.mean() / neg_std) * 252**0.5) if neg_std else float("nan")
+    mar = float(final_cum_r / dd) if dd and not math.isclose(dd, 0.0) else float("nan")
+    add_table(
+        doc,
+        ["Metric","Value"],
+        [
+            ["Final Cumulative R", f"{final_cum_r:.2f}"],
+            ["Sharpe Ratio", f"{sharpe:.2f}"],
+            ["Sortino Ratio", f"{sortino:.2f}"],
+            ["Max Drawdown (R)", f"{dd:.2f}"],
+            ["MAR Ratio", f"{mar:.2f}"],
+        ],
+    )
+else:
+    doc.add_paragraph("Hybrid trades file not found, risk metrics skipped.")
+
+# best config
+doc.add_heading("4. Best configuration", level=1)
+best = {
+    "Combine mode": "ml_gate_rules",
+    "ML threshold": "0.55",
+    "Horizon bars": hyb.get("horizon_bars", hyb.get("Horizon Bars","20")),
+    "Spread pips":  hyb.get("spread_pips", hyb.get("Spread (pips)","")),
+    "Commission USD": hyb.get("commission_usd", hyb.get("Commission (USD)","")),
+}
+for k,v in best.items():
+    p = doc.add_paragraph(); r1 = p.add_run(f"{k}: "); r1.bold=True; p.add_run(str(v))
+
+# lessons
+doc.add_heading("5. Lessons learned", level=1)
+for s in [
+    "Align features to the scaler list and keep preprocessing identical for training and inference",
+    "Normalize timestamps to UTC and round to bar size before merges",
+    "Use ML to gate rules for precision, avoid permissive either mode",
+    "Compare EV and drawdown together, not Profit Factor alone",
+    "Keep cost model and horizon constant across runs for fair comparisons",
+]:
+    doc.add_paragraph(f"• {s}")
+
+# reproducibility and Git notes
+doc.add_heading("6. Repro and Git notes", level=1)
+doc.add_paragraph("Winning backtest command, PowerShell:")
 doc.add_paragraph(
-    "Created repository structure, virtual environment, .gitignore, and installed dependencies "
-    "(pandas, numpy, scikit-learn, torch, python-docx). Confirmed local run and results folder."
+    "python scripts\\phase6_step4_hybrid_backtest.py "
+    "--features data\\m15_features.parquet "
+    "--predictions results\\phase6_predictions.csv "
+    "--rules_trades results\\phase5_rules_trades.csv "
+    "--combine_mode ml_gate_rules "
+    "--ml_threshold 0.55 "
+    "--out_dir results\\final_ml_gate_rules_th_055"
 )
+doc.add_paragraph("Push commits and tags, PowerShell:")
+doc.add_paragraph("git push ; git push --tags")
+doc.add_paragraph("Ignore generated artifacts in Git:")
+doc.add_paragraph("add to .gitignore -> results/*.csv, results/**/*.csv, results/*.json, results/**/*.json, models/*.pt, models/*.pkl")
 
-# Phase 1
-doc.add_heading("Phase 1 — Data Cleaning", level=2)
-doc.add_paragraph(
-    "Loaded raw 15-minute (M15) and 1-hour (H1) series, aligned timestamps, forward-filled missing bars, "
-    "and validated monotonicity. Saved cleaned parquet (`data/m15_features.parquet`)."
-)
+# sessions appendix
+if hyb_sessions.exists():
+    doc.add_heading("Appendix, session summary, hybrid", level=2)
+    sess = pd.read_csv(hyb_sessions)
+    cols = [c for c in sess.columns if c.lower() in {"session","trades","win_rate","profit_factor","avg_r","ev_r","sum_r"}]
+    if cols:
+        tt = doc.add_table(rows=1, cols=len(cols)); tt.style="Table Grid"
+        for i,hc in enumerate(cols): tt.rows[0].cells[i].text = hc
+        for _,row in sess[cols].iterrows():
+            cells = tt.add_row().cells
+            for i,hc in enumerate(cols):
+                val = row[hc]
+                cells[i].text = "" if pd.isna(val) else str(val)
 
-# Phase 2
-doc.add_heading("Phase 2 — Feature Engineering", level=2)
-doc.add_paragraph(
-    "Generated features: M15 ATR(14), EMA(20), spread_to_atr; H1 SMA(20/200), ADX(14), ATR(14), volatility_pct, "
-    "OBV, OBV_SMA50, OBV slope; trading sessions (Asia/London/NY); high-level regime marks (range/breakout)."
-)
-
-# Phase 3
-doc.add_heading("Phase 3 — Dataset Assembly", level=2)
-doc.add_paragraph(
-    "Merged features into a consistent, model-ready DataFrame with proper column ordering, "
-    "and stored metadata (lookback, feature names) in `data/dataset.npz`."
-)
-
-# Phase 4
-doc.add_heading("Phase 4 — Model Training (Prototype)", level=2)
-doc.add_paragraph(
-    "Implemented a baseline TCN prototype in PyTorch for later ML integration. Saved the feature scaler "
-    "to `models/scaler.pkl` for consistent normalization during backtests."
-)
-
-# Phase 5
-doc.add_heading("Phase 5 — Backtest + Diagnostics + EV", level=2)
-doc.add_paragraph(
-    "Built a rules-only backtester with session filters, regime/range checks, ADX gate, and OBV options. "
-    "Added safe handling of missing `timestamp` by synthetically generating 15-min bars and deriving "
-    "missing `spread_points` as needed. Implemented Expected Value (EV) tracking and created sweeps "
-    "(`sweep_spread_cap.py`, `sweep_filters.py`, `grid_filters_spread.py`) to grid-search parameters."
-)
-
-doc.add_paragraph("Key artifacts saved to `results/`:")
-add_table(
-    doc,
-    headers=["File", "What it contains"],
-    rows=[
-        ("backtest_summary.json", "Totals: win rate, PF, max DD, avg R, EV, diagnostics"),
-        ("trades.csv", "All simulated trades (timestamp, side, R, etc.)"),
-        ("spread_cap_sweep.csv", "Single-axis sweep results for spread/ATR cap"),
-        ("filter_sweep.csv", "Combinations of filter toggles with metrics"),
-        ("grid_sweep.csv", "Multi-parameter grid (caps + filters) ranked by score"),
-    ],
-    col_widths_in=[2.2, 4.0],
-)
-
-# 3. Lessons Learned
-doc.add_heading("3. Lessons Learned", level=1)
-doc.add_paragraph("• Always normalize features consistently using the saved scaler from training.")
-doc.add_paragraph("• Many data sources are timestamp-naive; handle with synthetic bars or tz-localize early.")
-doc.add_paragraph("• Spread constraints are the biggest driver of PF vs trade count — sweep narrow ranges.")
-doc.add_paragraph("• EV (Expected Value) is essential to avoid over-indexing on PF alone.")
-doc.add_paragraph("• Keep rules modular so we can flip filters on/off for apples-to-apples testing.")
-
-# 4. Current Best (Pre-ML Rules)
-doc.add_heading("4. Current Best (Pre-ML Rules)", level=1)
-doc.add_paragraph(
-    "From recent grid runs (≈5.9 years of M15), strong candidates cluster around "
-    "`SPREAD_TO_ATR_CAP ∈ [8, 12]` and `MAX_SPREAD_POINTS ≈ 20–40`, with session/regime filters ON, ADX filter ON, "
-    "and OBV confirmation optional. Use sweeps for your final instrument/broker feed."
-)
-add_table(
-    doc,
-    headers=["Param", "Value / Guidance", "Notes"],
-    rows=[
-        ("SPREAD_TO_ATR_CAP", "8–12", "Lower → fewer trades, higher PF; higher → more trades, lower PF"),
-        ("MAX_SPREAD_POINTS", "20–40", "Protect against abnormal spikes on exotic pairs"),
-        ("USE_SESSION", "True", "Asia/London/NY windows in MYT (09:00–03:00 wrap)"),
-        ("USE_REGIME_FILTER", "True", "Skip range or include breakout per your rules"),
-        ("USE_RANGE_SKIP", "True", "Avoid tight ranges before breakouts"),
-        ("USE_ADX_FILTER", "True", "Gate by trend strength (e.g., ADX long ≥22, short ≥30)"),
-        ("USE_OBV_PCT", "False", "Enable only if you add `% OBV` feature"),
-        ("USE_OBV_CONFIRM", "True/False", "Slightly improves stability on some feeds"),
-    ],
-    col_widths_in=[2.0, 2.0, 4.0],
-)
-
-# 5. Strategy Notes (Pre-ML)
-doc.add_heading("5. Strategy Notes (Pre-ML)", level=1)
-doc.add_paragraph(
-    "Entries: rule-based (range skip + ADX gate + sessions), with OBV optional confirmation. "
-    "Exits: fixed TP/SL in R-multiples; diagnostics compute PF, max DD (in R), and avg R."
-)
-doc.add_paragraph(
-    "Expected Value (EV): EV_R = win_rate * avg_win_R + (1 − win_rate) * avg_loss_R. "
-    "We track avg_win_R and avg_loss_R separately to avoid PF illusions."
-)
-
-# 6. Roadmap (6–10) — action-oriented
-doc.add_heading("6. Roadmap (Phases 6 → 10)", level=1)
-doc.add_paragraph("• Phase 6 — ML Integration: train a classifier (e.g., LightGBM) on features + labels to predict EV-positive setups.")
-doc.add_paragraph("• Phase 7 — Real-Time Service: convert backtest features to rolling calculation for live inference.")
-doc.add_paragraph("• Phase 8 — MT5 Bridge: send signals via ZeroMQ or CSV drop; implement order/position sync & slippage control.")
-doc.add_paragraph("• Phase 9 — Monitoring: add live dashboards (PnL, DD, drift, exposures) and daily EV sanity checks.")
-doc.add_paragraph("• Phase 10 — Packaging: versioned configs, automated backtests, CI/CD for research and deployment.")
-
-# Appendix
-doc.add_heading("Appendix — Key Repository Paths", level=1)
-add_table(
-    doc,
-    headers=["Path", "Description"],
-    rows=[
-        ("data/m15_features.parquet", "Primary features parquet used by backtester"),
-        ("models/scaler.pkl", "Feature scaler learned during training"),
-        ("scripts/phase5_backtest.py", "Main rules backtester with EV"),
-        ("scripts/sweep_spread_cap.py", "One-dim sweep for SPREAD_TO_ATR_CAP"),
-        ("scripts/sweep_filters.py", "Filter-toggle sweep"),
-        ("scripts/grid_filters_spread.py", "Grid search for caps + filters with score"),
-        ("results/", "All outputs (trades.csv, summaries, sweeps)"),
-    ],
-    col_widths_in=[2.3, 4.2],
-)
-
-# Save
-doc.save(str(OUT_FILE))
-print(f"✅ Word file written: {OUT_FILE.resolve()}")
+out = RESULTS / "Phase0_to_Phase6_Summary_with_Lessons.docx"
+doc.save(out)
+print(f"Saved: {out}")
