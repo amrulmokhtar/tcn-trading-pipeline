@@ -1,207 +1,257 @@
-# train_export_tcn.py  self contained, no external tcn package needed
-import os, json, random, numpy as np, pandas as pd
-import torch, torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import classification_report, confusion_matrix
+# scripts/train_export_tcn.py
+# TCN model definition and a self contained training and export CLI.
+# Safe to import: no CSV reads or training happen at import time.
 
-SEED = 1337
-random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+from typing import List, Tuple, Optional
+from pathlib import Path
 
-CSV = "TRAIN_TABLE.csv"
-SCALER_JSON = "SCALER.json"
-ONNX_OUT = "tcn_signal.onnx"
-PT_OUT = "tcn_signal.pt"
-FEAT_SPEC = "feature_spec.json"
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-WIN = 32
-HORIZON = 6
-BATCH = 256
-EPOCHS = 15
-LR = 1e-3
-VAL_SIZE = 0.15
 
-FEATURES = [
-    "open","high","low","close","tick_volume",
-    "atr14_m15","sma20_m15","ema50_m15","dist_sma20","dist_ema50",
-    "body_over_atr","range_over_atr","logret","obv_delta_m15",
-    "atr14p_h1","obv_slope_h1","spread_over_atr",
-    "sess_asia","sess_london","sess_ny"
-]
-CLASSES = ["Long","Short","None"]
-CLASS_TO_ID = {c:i for i,c in enumerate(CLASSES)}
-
-# ---------------- dataset ----------------
-class SeqDS(Dataset):
-    def __init__(self, df, scalers):
-        x = df[FEATURES].to_numpy(dtype=np.float32)
-        y = df["target_class"].map(CLASS_TO_ID).to_numpy(dtype=np.int64)
-        for j, col in enumerate(FEATURES):
-            mu = scalers[col]["mean"]; sd = max(1e-8, scalers[col]["std"])
-            x[:, j] = (x[:, j] - mu) / sd
-        Xw, Yw = [], []
-        for i in range(WIN, len(x)):
-            Xw.append(x[i-WIN:i, :])     # [WIN, F]
-            Yw.append(y[i])
-        self.X = np.stack(Xw, axis=0)    # [N, WIN, F]
-        self.Y = np.array(Yw)
-    def __len__(self): return len(self.Y)
-    def __getitem__(self, idx):
-        return torch.from_numpy(self.X[idx]), torch.tensor(self.Y[idx])
-
-# ---------------- model: minimal TCN in PyTorch ----------------
-class Chomp1d(nn.Module):
-    def __init__(self, chomp): 
-        super().__init__(); self.chomp = chomp
-    def forward(self, x):                 # x [N, C, L+pad]
-        return x[:, :, :-self.chomp].contiguous() if self.chomp > 0 else x
+# ------------------------------ blocks ------------------------------
 
 class TemporalBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, k=3, d=1, dropout=0.1):
+    """
+    Dilated causal 1D Conv block with residual connection.
+    Expects input shaped [N, C, L].
+    """
+    def __init__(self,
+                 in_ch: int,
+                 out_ch: int,
+                 k: int = 3,
+                 d: int = 1,
+                 dropout: float = 0.1):
         super().__init__()
         pad = (k - 1) * d
-        self.net = nn.Sequential(
-            nn.utils.weight_norm(nn.Conv1d(in_ch, out_ch, k, padding=pad, dilation=d)),
-            Chomp1d(pad),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.utils.weight_norm(nn.Conv1d(out_ch, out_ch, k, padding=pad, dilation=d)),
-            Chomp1d(pad),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-        self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
-        self.init_weights()
-    def init_weights(self):
+        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=pad, dilation=d)
+        self.bn1   = nn.BatchNorm1d(out_ch)
+        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size=k, padding=pad, dilation=d)
+        self.bn2   = nn.BatchNorm1d(out_ch)
+        self.dropout = nn.Dropout(dropout)
+
+        self.downsample = nn.Conv1d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else None
+        self.relu = nn.ReLU(inplace=True)
+
+        # kaiming init, zero biases
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
                 nn.init.kaiming_normal_(m.weight)
-                if m.bias is not None: nn.init.zeros_(m.bias)
-    def forward(self, x):                 # x [N, C, L]
-        out = self.net(x)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # [N, C, L]
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+
         res = x if self.downsample is None else self.downsample(x)
-        return torch.relu(out + res)
+        return self.relu(out + res)
+
+
+# ------------------------------ model ------------------------------
 
 class TCN(nn.Module):
-    def __init__(self, in_feat, channels=(64,64,64,64), k=3, dropout=0.1, n_classes=3):
+    """
+    Temporal Convolutional Network head.
+    Constructor and forward are aligned to your previous file:
+      __init__(self, in_feat, channels=(64,64,64,64), k=3, dropout=0.1, n_classes=3)
+      forward(x) expects [N, L, F]
+    Internally we transpose to [N, F, L], pass through TCN blocks,
+    global average pool over time, then a Linear to n_classes.
+    """
+    def __init__(self,
+                 in_feat: int,
+                 channels: Tuple[int, ...] = (64, 64, 64, 64),
+                 k: int = 3,
+                 dropout: float = 0.1,
+                 n_classes: int = 3):
         super().__init__()
-        layers = []
+        layers: List[nn.Module] = []
         c_in = in_feat
         for i, c in enumerate(channels):
             d = 2 ** i
             layers.append(TemporalBlock(c_in, c, k=k, d=d, dropout=dropout))
             c_in = c
-        self.tcn = nn.Sequential(*layers)
+        self.tcn  = nn.Sequential(*layers)
         self.pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(c_in, n_classes)
-    def forward(self, x):                 # x [N, L, F]
-        x = x.transpose(1, 2).contiguous()  # [N, F, L]
-        z = self.tcn(x)                     # [N, C, L]
-        h = self.pool(z).squeeze(-1)        # [N, C]
-        return self.fc(h)                   # [N, n_classes]
+        self.fc   = nn.Linear(c_in, n_classes)
 
-# ---------------- load data ----------------
-df = pd.read_csv(CSV, parse_dates=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-with open(SCALER_JSON, "r") as f: scalers = json.load(f)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [N, L, F] -> [N, F, L]
+        x = x.transpose(1, 2).contiguous()
+        z = self.tcn(x)                 # [N, C, L]
+        h = self.pool(z).squeeze(-1)    # [N, C]
+        return self.fc(h)               # [N, n_classes]
 
-# --- clean invalid labels and NaNs ---
-valid_classes = {"Long", "Short", "None"}
-df = df[df["target_class"].isin(valid_classes)].copy()
-df = df.dropna(subset=FEATURES + ["target_class"]).reset_index(drop=True)
-print(f"Cleaned dataset size: {len(df)} rows")
 
-# make sure flags are numeric
-for c in ["sess_asia","sess_london","sess_ny"]:
-    df[c] = df[c].astype("float32")
+# ------------------------------ CLI training ------------------------------
 
-# drop first WIN rows so windows form cleanly
-df = df.iloc[WIN:].reset_index(drop=True)
+def _infer_device() -> torch.device:
+    return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
-split_ix = int(len(df) * (1.0 - VAL_SIZE))
-df_tr = df.iloc[:split_ix].reset_index(drop=True)
-df_va = df.iloc[split_ix:].reset_index(drop=True)
 
-tr_ds, va_ds = SeqDS(df_tr, scalers), SeqDS(df_va, scalers)
-tr_loader = DataLoader(tr_ds, batch_size=BATCH, shuffle=True, drop_last=True)
-va_loader = DataLoader(va_ds, batch_size=BATCH, shuffle=False)
+def _make_windows(x: torch.Tensor, y: torch.Tensor, seq_len: int):
+    """
+    x: [T, F], y: [T] integer class labels
+    returns Xw [N, L, F], Yw [N]
+    """
+    T = x.shape[0]
+    if T < seq_len:
+        return torch.empty(0, seq_len, x.shape[1]), torch.empty(0, dtype=torch.long)
+    Xw = []
+    Yw = []
+    for i in range(seq_len - 1, T):
+        Xw.append(x[i - seq_len + 1:i + 1])
+        Yw.append(y[i])
+    return torch.stack(Xw, dim=0), torch.stack(Yw, dim=0)
 
-in_feat = len(FEATURES); classes = len(CLASSES)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = TCN(in_feat=in_feat, channels=(64,64,64,64), k=3, dropout=0.1, n_classes=classes).to(device)
 
-# class weights
-cnt = df_tr["target_class"].value_counts().reindex(CLASSES).fillna(1).to_numpy(np.float32)
-w = cnt.sum() / (cnt + 1e-6); w = w / w.sum() * classes
-crit = nn.CrossEntropyLoss(weight=torch.tensor(w, device=device, dtype=torch.float32))
-opt = torch.optim.Adam(model.parameters(), lr=LR)
+def _class_mapping(names: List[str]):
+    """
+    Map string labels to indices. Default order keeps compatibility with your pipeline.
+    """
+    name_to_idx = {n: i for i, n in enumerate(names)}
+    return name_to_idx
 
-# ---------------- train ----------------
-best_val = 1e9; best_state = None
-for ep in range(1, EPOCHS+1):
-    model.train(); tr_loss = 0.0
-    for xb, yb in tr_loader:
-        xb, yb = xb.to(device), yb.to(device)
-        opt.zero_grad()
-        loss = crit(model(xb), yb)
-        loss.backward(); opt.step()
-        tr_loss += loss.item() * xb.size(0)
-    tr_loss /= len(tr_ds)
 
-    model.eval(); va_loss = 0.0
-    with torch.no_grad():
-        for xb, yb in va_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            va_loss += crit(model(xb), yb).item() * xb.size(0)
-    va_loss /= len(va_ds)
-    print(f"Epoch {ep:02d}  train {tr_loss:.4f}  val {va_loss:.4f}")
-    if va_loss < best_val:
-        best_val = va_loss
-        best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+def train_and_export(csv_path: str,
+                     out_state_dict: str,
+                     out_jit: Optional[str],
+                     timestamp_col: str,
+                     feature_cols: List[str],
+                     label_col: str,
+                     class_names: List[str],
+                     seq_len: int = 64,
+                     batch_size: int = 256,
+                     lr: float = 1e-3,
+                     epochs: int = 5,
+                     seed: int = 1337,
+                     clip_grad: Optional[float] = 1.0):
+    """
+    Minimal training loop to produce a state_dict compatible with TCN above.
+    """
+    import pandas as pd
+    import numpy as np
+    from torch.utils.data import DataLoader, TensorDataset
 
-# restore best and save
-model.load_state_dict(best_state)
-torch.save(model.state_dict(), PT_OUT); print(f"Saved PyTorch weights to {PT_OUT}")
+    torch.manual_seed(seed)
+    device = _infer_device()
 
-# ---------------- report ----------------
-model.eval()
-preds, gts = [], []
-with torch.no_grad():
-    for xb, yb in va_loader:
-        logits = model(xb.to(device))
-        preds.append(logits.argmax(1).cpu().numpy())
-        gts.append(yb.numpy())
+    # load data
+    df = pd.read_csv(csv_path)
+    if timestamp_col in df.columns:
+        df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
+        df = df.sort_values(timestamp_col).reset_index(drop=True)
 
-preds = np.concatenate(preds)
-gts = np.concatenate(gts)
+    # build features and labels
+    assert all(c in df.columns for c in feature_cols), f"Missing feature columns, need {feature_cols}"
+    assert label_col in df.columns, f"Missing label column {label_col}"
 
-# ✅ FIXED REPORT BLOCK
-from sklearn.metrics import classification_report, confusion_matrix
+    x_np = df[feature_cols].astype("float32").to_numpy()
+    # label can be already numeric or string
+    if df[label_col].dtype == object:
+        name_to_idx = _class_mapping(class_names)
+        y_np = df[label_col].map(name_to_idx).astype("int64").to_numpy()
+    else:
+        y_np = df[label_col].astype("int64").to_numpy()
 
-labels_all = [0, 1, 2]  # Long, Short, None
-print(confusion_matrix(gts, preds, labels=labels_all))
-print(classification_report(
-    gts, preds,
-    labels=labels_all,
-    target_names=CLASSES,
-    digits=3,
-    zero_division=0
-))
+    x = torch.from_numpy(x_np)  # [T, F]
+    y = torch.from_numpy(y_np)  # [T]
 
-# ---------------- export ONNX ----------------
-dummy = torch.zeros(1, WIN, in_feat, dtype=torch.float32).to(device)
-torch.onnx.export(
-    model, dummy, ONNX_OUT,
-    input_names=["input"], output_names=["logits"],
-    dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
-    opset_version=13
-)
-print(f"Saved ONNX to {ONNX_OUT}")
+    Xw, Yw = _make_windows(x, y, seq_len)
+    if Xw.numel() == 0:
+        raise ValueError(f"Not enough rows to form windows of length {seq_len}")
 
-# ---------------- feature spec for EA ----------------
-spec = {
-    "window": WIN,
-    "features": FEATURES,
-    "class_order": CLASSES,
-    "scaler": {k: {"mean": float(v["mean"]), "std": float(v["std"])} for k, v in scalers.items()}
-}
-with open(FEAT_SPEC, "w") as f: json.dump(spec, f, indent=2)
-print(f"Saved feature spec to {FEAT_SPEC}")
+    ds = TensorDataset(Xw, Yw)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=False)
+
+    # model
+    model = TCN(in_feat=x.shape[1], channels=(64, 64, 64, 64), k=3, dropout=0.1, n_classes=len(class_names))
+    model.to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    crit = nn.CrossEntropyLoss()
+
+    model.train()
+    for ep in range(1, epochs + 1):
+        total, correct, loss_sum, n = 0, 0, 0.0, 0
+        for xb, yb in dl:
+            xb = xb.to(device)           # [N, L, F]
+            yb = yb.to(device)           # [N]
+            opt.zero_grad()
+            logits = model(xb)           # [N, C]
+            loss = crit(logits, yb)
+            loss.backward()
+            if clip_grad is not None:
+                nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            opt.step()
+
+            with torch.no_grad():
+                pred = logits.argmax(dim=1)
+                total += yb.size(0)
+                correct += (pred == yb).sum().item()
+                loss_sum += float(loss.item()) * yb.size(0)
+                n += yb.size(0)
+
+        acc = correct / max(1, total)
+        avg_loss = loss_sum / max(1, n)
+        print(f"epoch {ep:02d} loss {avg_loss:.4f} acc {acc:.4f}")
+
+    # export
+    Path(out_state_dict).parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), out_state_dict)
+    print(f"saved state_dict to {out_state_dict}")
+
+    if out_jit:
+        model.eval()
+        eg = torch.zeros(1, seq_len, x.shape[1], device=device)  # [N, L, F]
+        ts = torch.jit.trace(model, eg)
+        Path(out_jit).parent.mkdir(parents=True, exist_ok=True)
+        ts.save(out_jit)
+        print(f"saved torchscript to {out_jit}")
+
+
+# ------------------------------ entry point ------------------------------
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Train and export a TCN state_dict or TorchScript")
+    ap.add_argument("--csv", default="TRAIN_TABLE.csv", help="Input CSV for quick training")
+    ap.add_argument("--timestamp_col", default="timestamp")
+    ap.add_argument("--features", default="m15_close,m15_atr14", help="Comma separated feature columns")
+    ap.add_argument("--label_col", default="label", help="Target class column")
+    ap.add_argument("--class_order", default="SELL,FLAT,BUY", help="Comma order for classes")
+    ap.add_argument("--seq_len", type=int, default=64)
+    ap.add_argument("--batch_size", type=int, default=256)
+    ap.add_argument("--epochs", type=int, default=5)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--out_state", default="models/tcn_model.pt")
+    ap.add_argument("--out_jit", default="", help="Optional, path to save TorchScript, leave blank to skip")
+    args = ap.parse_args()
+
+    feature_cols = [c.strip() for c in args.features.split(",") if c.strip()]
+    class_names = [c.strip().upper() for c in args.class_order.split(",") if c.strip()]
+
+    out_jit = args.out_jit if args.out_jit else None
+
+    train_and_export(csv_path=args.csv,
+                     out_state_dict=args.out_state,
+                     out_jit=out_jit,
+                     timestamp_col=args.timestamp_col,
+                     feature_cols=feature_cols,
+                     label_col=args.label_col,
+                     class_names=class_names,
+                     seq_len=args.seq_len,
+                     batch_size=args.batch_size,
+                     lr=args.lr,
+                     epochs=args.epochs)
+
+if __name__ == "__main__":
+    main()
